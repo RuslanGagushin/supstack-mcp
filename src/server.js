@@ -3,16 +3,17 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { Vault, VaultError } from "./vault.js";
 
-export const VERSION = "0.1.0";
+export const VERSION = "0.2.0";
 
 const INSTRUCTIONS = `This server reads and changes a Supstack vault: a folder of plain Markdown notes that the Supstack app shows as notebooks, with tasks and an agenda.
 
 - A note is a .md file; its name is its title, and names are unique in the vault. Refer to a note by its name.
 - A notebook is a note that holds other notes. A note lists its notebooks in the \`parents\` property and can sit in several at once; the tools manage that property, so don't write it by hand.
 - Link notes with [[Note name]]; embed with ![[Note name]] or ![[Note name#Heading]]. Don't start a note with an H1 that repeats its name.
-- A task is a list item with a box: \`- [ ]\` to do, \`- [/]\` in progress, \`- [<]\` waiting, \`- [x]\` done, \`- [-]\` cancelled, \`- [>]\` forwarded. Headings are never tasks. A priority goes after the box (\`- [ ] [#A] …\`); dates go on the next line, indented: \`  SCHEDULED: <2026-11-19 Thu 10:00> DEADLINE: <2026-11-21 Sat>\`, with repeaters (+1w, ++1m, .+3d). A plain line with \`<2026-11-19 Thu 14:00>\` is an event.
-- Change a task's state or dates with update_task rather than by editing text: it writes CLOSED: and moves a repeating task to its next date, as the app does.
-- Daily notes are named YYYY-MM-DD; add_task without a note puts the task into today's.
+- Tasks and events live in .supstack/tasks.jsonl. Boxes in Markdown notes are checklists and stay out of the agenda.
+- Use add_task with a title and optional note, scheduled date, deadline, priority and tags. Omitting the note creates a standalone task. Pass dates, tags and note links as separate fields.
+- Use update_task with the stable ID from list_tasks or agenda. Marking a repeating task done advances its date; other closures record a closed time and appear on that day in the agenda.
+- Daily notes are named YYYY-MM-DD and can be opened separately with daily_note.
 - Call vault_info first to see today's date, the top-level notebooks and the tags.
 - Deleted notes go to the vault's .trash. The app syncs the vault with git itself; this server never runs git.`;
 
@@ -23,6 +24,7 @@ const when = "A date: 2026-11-20, \"2026-11-20 14:00\", \"2026-11-20 14:00-15:30
 export function createServer(root, { readOnly = false } = {}) {
   const vault = new Vault(root, { readOnly });
   const server = new McpServer({ name: "supstack", version: VERSION }, { instructions: INSTRUCTIONS });
+  let queued = Promise.resolve();
 
   const json = (v) => ({ content: [{ type: "text", text: JSON.stringify(v, null, 2) }] });
   /** A tool: the vault is looked at again before every call, and a VaultError is an answer, not a crash. */
@@ -31,15 +33,20 @@ export function createServer(root, { readOnly = false } = {}) {
     server.registerTool(name, {
       title, description, inputSchema: shape,
       annotations: { readOnlyHint: !write && !(creates && !readOnly), destructiveHint: destructive, idempotentHint: !write, openWorldHint: false },
-    }, async (args) => {
-      try {
-        await vault.refresh();
-        const out = await fn(args);
-        return out?.content ? out : json(out);
-      } catch (e) {
-        if (e instanceof VaultError) return { isError: true, content: [{ type: "text", text: e.message }] };
-        throw e;
-      }
+    }, (args) => {
+      // Keep refresh and the tool action together when callers send parallel requests.
+      const result = queued.then(async () => {
+        try {
+          await vault.refresh();
+          const out = await fn(args);
+          return out?.content ? out : json(out);
+        } catch (e) {
+          if (e instanceof VaultError) return { isError: true, content: [{ type: "text", text: e.message }] };
+          throw e;
+        }
+      });
+      queued = result.catch(() => {});
+      return result;
     });
   };
 
@@ -54,7 +61,7 @@ export function createServer(root, { readOnly = false } = {}) {
     limit: z.number().int().min(1).max(1000).default(200),
   }, (a) => vault.list(a));
 
-  tool("read_note", "Read a note", "A note's full Markdown (with its frontmatter), plus its notebooks, the notes inside it, the notes that link to it and its task counts. Line N of the text is line N for update_task.",
+  tool("read_note", "Read a note", "A note's full Markdown (with its frontmatter), plus its notebooks, the notes inside it, the notes that link to it, and counts of linked tasks and checklist boxes.",
     { note: noteRef }, ({ note }) => {
       const { meta, text } = vault.read(note);
       return { content: [{ type: "text", text: JSON.stringify(meta, null, 2) }, { type: "text", text }] };
@@ -70,17 +77,16 @@ export function createServer(root, { readOnly = false } = {}) {
     states: z.array(z.enum(["open", "closed", "all", ...STATES])).default(["open"]).describe("open = todo, doing, wait; closed = done, cancel, fwd"),
     note: noteRef.optional().describe("Only the tasks of this note"),
     notebook: noteRef.optional().describe("Only the tasks of this notebook and everything inside it"),
-    tag: z.string().optional().describe("Only tasks with this tag (their own, or inherited from a heading or the note)"),
+    tag: z.string().optional().describe("Only tasks with this tag (their own, or inherited from the linked note)"),
     priority: z.enum(["A", "B", "C"]).optional(),
     due: z.enum(["overdue", "today", "week", "dated", "undated"]).optional().describe("overdue: date before today; today: overdue or today; week: up to 7 days ahead; dated / undated: with or without SCHEDULED or DEADLINE"),
     query: z.string().optional().describe("Only tasks whose title has this text"),
     limit: z.number().int().min(1).max(1000).default(100),
   }, (a) => vault.tasks(a));
 
-  tool("agenda", "Agenda", "The agenda as the app shows it, day by day: scheduled tasks, deadlines (with early warnings and overdue items under today), repeating tasks on each of their days, and events.", {
+  tool("agenda", "Agenda", "The agenda as the app shows it, day by day: scheduled tasks, deadlines (with early warnings and overdue items under today), repeating tasks, events, and tasks on the day they closed.", {
     from: z.string().optional().describe("The first day (default: today). " + when),
     days: z.number().int().min(1).max(62).default(7),
-    closed: z.boolean().default(false).describe("Also list tasks on the day they were closed"),
   }, (a) => vault.agenda(a));
 
   /* ---------- writing */
@@ -128,31 +134,28 @@ export function createServer(root, { readOnly = false } = {}) {
   tool("delete_note", "Delete a note", "Delete a note; a copy is kept in the vault's .trash folder. Notes inside it are not deleted, and links to it break. Ask the user before deleting.",
     { note: noteRef }, (a) => vault.remove(a), { write: true, destructive: true });
 
-  tool("add_task", "Add a task", "Add a task to a note: today's daily note by default (created if needed), as the app's quick capture does.", {
+  tool("add_task", "Add a task", "Create a standalone task or link it to an existing note, as in Capture. Pass dates, note and tags in their own fields.", z.strictObject({
     title: z.string().min(1).describe("What to do, one line"),
-    note: noteRef.optional().describe("The note to add it to (default: today's daily note)"),
-    heading: z.string().optional().describe("Add it at the end of this heading's section instead of the end of the note"),
+    note: noteRef.optional().describe("The existing note to link to (omit for a standalone task)"),
     scheduled: z.string().optional().describe("When to do it. " + when),
     deadline: z.string().optional().describe("When it is due. " + when),
     priority: z.enum(["A", "B", "C"]).optional(),
     tags: z.array(z.string()).default([]).describe("Tags, without #"),
     state: z.enum(STATES).default("todo"),
-    notes: z.string().optional().describe("Lines of detail under the task"),
-  }, (a) => vault.addTask(a), { write: true });
+  }), (a) => vault.addTask(a), { write: true });
 
-  tool("update_task", "Change a task", "Change a task's state, dates, priority, title or tags. Closing a task writes CLOSED:, and closing a repeating task moves it to its next date instead. Identify the task by its note and its line (from list_tasks, agenda or read_note), its title, or both; the title is checked, so a stale line number does not change the wrong task.", {
-    note: noteRef,
-    line: z.number().int().min(1).optional().describe("The task's line in the note, as list_tasks gives it"),
-    title: z.string().optional().describe("The task's title, to find it or to check the line"),
+  tool("update_task", "Change a task", "Change a task's state, dates, priority, title, tags or note link. Marking a repeating task done moves it to its next date. Identify the task by its stable ID from list_tasks or agenda.", z.strictObject({
+    id: z.string().min(1).describe("The task ID returned by list_tasks, agenda or add_task"),
+    note: noteRef.nullable().optional().describe("The existing note to link to, or null to remove the link"),
     state: z.enum(STATES).optional().describe("todo, doing (in progress), wait (waiting), done, cancel (cancelled), fwd (forwarded elsewhere)"),
     scheduled: z.string().nullable().optional().describe("New SCHEDULED date, or null to remove it. " + when),
     deadline: z.string().nullable().optional().describe("New DEADLINE date, or null to remove it. " + when),
     priority: z.enum(["A", "B", "C"]).nullable().optional().describe("null removes the priority"),
     new_title: z.string().optional(),
-    tags: z.array(z.string()).optional().describe("The task's own :tags: at the end of its line (replaces them); #tags inside the title are part of the title"),
-  }, (a) => vault.updateTask(a), { write: true });
+    tags: z.array(z.string()).optional().describe("Replace the task's explicit tags (without #). Hashtags in the title are part of the title."),
+  }), (a) => vault.updateTask(a), { write: true });
 
-  tool("daily_note", "Open a daily note", "The daily note of a day (today by default): created empty if it is not there, then returned like read_note. Use edit_note or add_task to add to it.", {
+  tool("daily_note", "Open a daily note", "The daily note of a day (today by default): created empty if it is not there, then returned like read_note. Use edit_note to change its text; pass its name as note to add_task to link a task.", {
     date: z.string().optional().describe("The day (default: today): 2026-11-20, today, yesterday, tomorrow, fri"),
     create: z.boolean().default(true).describe("Create the note when it does not exist"),
   }, async ({ date, create }) => {

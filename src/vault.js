@@ -3,15 +3,14 @@
    made in the app or by sync are seen; the app in turn picks up what is written here. */
 import fs from "node:fs/promises";
 import path from "node:path";
+import { randomUUID } from "node:crypto";
 import {
   baseName, cleanTag, composeBody, composeNote, dirName, extractLinkpath, fillTemplate, fmInner, headingsText, matchRank,
   norm, noteLinks, noteTags, parentLinkpaths, parseQuery, parseYaml, plainText, sanitizeTitle, splitNote,
   TEMPLATE_SKIP_KEYS, toStringList,
 } from "./core/frontmatter.js";
-import {
-  ohm, onow, orgBuild, orgDayEntries, orgHead, orgLine, orgParse, orgReadDate, orgSetPlanning, orgSetPriority,
-  orgSetState, orgSkip, orgTsParse, orgTsStr, oymd, opad, TASK_STATES,
-} from "./core/org.js";
+import { ohm, onow, orgDayEntries, orgParse, orgReadDate, orgSkip, orgTsParse, orgTsStr, oymd, opad, TASK_STATES } from "./core/org.js";
+import { hasLegacyTasks, newId, parseTasks, serializeTasks, taskEntry, taskSetState, TASKS_PATH, withNoteId } from "./core/tasks.js";
 
 export const CARDS = "cards";
 export const DAILY = "daily notes";
@@ -26,11 +25,19 @@ const topFolder = (p) => (p.includes("/") ? p.slice(0, p.indexOf("/")).toLowerCa
 const isoDay = (dn) => { const o = oymd(dn); return `${o.y}-${opad(o.m)}-${opad(o.d)}`; };
 const strictUtf8 = new TextDecoder("utf-8", { fatal: true });
 const nameCollator = new Intl.Collator(undefined, { numeric: true, sensitivity: "base" });
+const noteId = (n) => n.fm.id == null || n.fm.id === "" ? null : String(n.fm.id);
+const taskTitle = (title) => title.replace(/\s*[\r\n]+\s*/g, " ").trim();
+const taskTags = (tags) => tags.map(cleanTag).filter(Boolean);
+
+async function readText(file) {
+  try { return await fs.readFile(file, "utf8"); }
+  catch (e) { if (e.code === "ENOENT") return null; throw e; }
+}
 
 /** A date as the app's date prompt reads it ("tomorrow 10:00", "fri", "+3d", "2026-11-20 +1w") or an Org timestamp. */
 export function parseWhen(text) {
   const s = String(text).trim();
-  const r = /^[<[]/.test(s) ? orgTsParse(s) : orgReadDate(s);
+  const r = s && (/^[<[]/.test(s) ? orgTsParse(s) : orgReadDate(s));
   if (!r) throw new VaultError(`Cannot read the date "${text}". Use 2026-11-20, "2026-11-20 14:00", tomorrow, fri, +3d, optionally with a repeater (+1w, ++1m, .+3d) or a warning (-2d).`);
   return { active: true, dn: r.dn, time: r.time ?? null, end: r.end ?? null, rep: r.rep ?? null, warn: r.warn ?? null };
 }
@@ -109,6 +116,10 @@ export class Vault {
     }
     this.cache = cache;
     this.index();
+    this.taskText = await readText(this.abs(TASKS_PATH));
+    this.taskStore = parseTasks(this.taskText);
+    this.taskMigrationRequired = this.taskText === null &&
+      [...this.notes.values()].some((n) => n.raw.length <= 400000 && hasLegacyTasks(orgParse(n)));
     return this;
   }
   parseNote(p, raw, mtime) {
@@ -121,6 +132,11 @@ export class Vault {
   /** Names, then the hierarchy: who is in which notebook, the order inside one, and who links to whom. */
   index() {
     this.byName = new Map();
+    this.byId = new Map();
+    for (const n of this.notes.values()) {
+      const id = noteId(n);
+      if (id && !this.byId.has(id)) this.byId.set(id, n);
+    }
     for (const p of this.notes.keys()) { const k = key(baseName(p)); (this.byName.get(k) || this.byName.set(k, []).get(k)).push(p); }
     this.parents = new Map(); this.children = new Map(); this.childOrder = new Map(); this.linksIn = new Map(); this.unresolved = new Map();
     for (const n of this.notes.values()) {
@@ -247,6 +263,7 @@ export class Vault {
       top_level: this.sortedChildren(null).slice(0, 100).map((p) => { const k = this.childrenOf(p).length; return k ? `${baseName(p)} (${k})` : baseName(p); }),
       tags: [...tags].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0])).slice(0, 100).map(([t, n]) => `${t} (${n})`),
       tasks: { open, overdue, due_today: today },
+      ...(this.taskMigrationRequired ? { task_migration_required: true } : {}),
       ...(this.unreadable.length ? { unreadable_files: this.unreadable } : {}),
     };
   }
@@ -278,8 +295,10 @@ export class Vault {
     if (kids.length) { delete meta.notes_inside; meta.notes_inside = kids.map(baseName); }
     const back = [...(this.linksIn.get(n.path) ?? [])].map(baseName).sort(nameCollator.compare);
     if (back.length) meta.linked_from = back;
-    const tasks = orgParse(n).filter((e) => e.isTodo);
+    const tasks = this.entries(new Set([n.path])).filter((e) => e.isTodo);
     if (tasks.length) meta.tasks = { open: tasks.filter((e) => !e.done).length, closed: tasks.filter((e) => e.done).length };
+    const boxes = orgParse(n).filter((e) => e.isTodo && e.kw !== "cancel" && e.kw !== "fwd");
+    if (boxes.length) meta.checklist = { total: boxes.length, done: boxes.filter((e) => e.kw === "done").length };
     return { meta, text: n.raw };
   }
   search({ query, notebook = null, limit = 30 }) {
@@ -345,7 +364,7 @@ export class Vault {
     const now = new Date();
     if (tpl) {
       for (const [k, v] of Object.entries(tpl.fm)) {
-        if (TEMPLATE_SKIP_KEYS.has(k) || k === "parents") continue;
+        if (TEMPLATE_SKIP_KEYS.has(k) || k === "parents" || k === "id") continue;
         fm[k] = typeof v === "string" ? fillTemplate(v, clean, now) : structuredClone(v);
       }
       tplBody = fillTemplate(tpl.body, clean, now);
@@ -492,21 +511,23 @@ export class Vault {
 
   /* ---------- tasks */
 
-  /** Every task and dated line of the vault. */
+  /** Tasks and events from the active store. The archive and note checklists are separate. */
   entries(scope = null) {
     const out = [];
-    for (const n of this.notes.values()) { if (n.raw.length > 400000 || (scope && !scope.has(n.path))) continue; out.push(...orgParse(n)); }
+    for (const rec of this.taskStore.records.values()) {
+      const note = this.byId.get(rec.note);
+      if (!scope || scope.has(note?.path)) out.push(taskEntry(rec, note));
+    }
     return out;
   }
   taskOut(e) {
-    const o = { note: baseName(e.path), line: e.line + 1, state: e.kw, title: e.title };
+    const o = { id: e.id, note: e.note, state: e.kw, title: e.title };
+    if (e.noteGone) o.note_missing = true;
     if (e.pri) o.priority = e.pri;
     if (e.sched) o.scheduled = orgTsStr(e.sched);
     if (e.dead) o.deadline = orgTsStr(e.dead);
     if (e.closed) o.closed = orgTsStr(e.closed);
     if (e.alltags.length) o.tags = e.alltags;
-    if (e.cbTotal) o.subtasks = `${e.cbDone}/${e.cbTotal}`;
-    if (e.outline.length) o.under = e.outline.join(" › ");
     return o;
   }
   tasks({ states = ["open"], note = null, notebook = null, tag = null, priority = null, due = null, query = null, limit = 100 } = {}) {
@@ -537,23 +558,24 @@ export class Vault {
       return true;
     });
     const pri = (e) => (e.pri ? e.pri.charCodeAt(0) : 68.5); // no priority sorts between C and D
-    hits.sort((a, b) => date(a) - date(b) || pri(a) - pri(b) || a.path.localeCompare(b.path) || a.line - b.line);
+    hits.sort((a, b) => date(a) - date(b) || pri(a) - pri(b) || (a.path ?? "").localeCompare(b.path ?? "") || a.id.localeCompare(b.id));
     return { today: isoDay(T), found: hits.length, ...(hits.length > limit ? { showing: limit } : {}), tasks: hits.slice(0, limit).map((e) => this.taskOut(e)) };
   }
-  agenda({ from = null, days = 7, closed = false } = {}) {
+  agenda({ from = null, days = 7 } = {}) {
     const T = onow().dn;
     const start = from ? parseWhen(from).dn : T;
     const all = this.entries();
     const carried = T >= start && T < start + days;
     const out = [];
     for (let dn = start; dn < start + days; dn++) {
-      const ents = orgDayEntries(dn, all, T, { log: closed, carried }).map((x) => {
+      const ents = orgDayEntries(dn, all, T, { log: true, carried }).map((x) => {
         const o = {};
         if (x.time != null) o.time = ohm(x.time) + (x.end != null ? "-" + ohm(x.end) : "");
         if (x.label) o.what = x.label;
         if (x.overdue) o.overdue = true;
         const e = x.e;
-        Object.assign(o, { title: e.title, ...(e.isTodo ? { state: e.kw } : { event: true }), ...(e.pri ? { priority: e.pri } : {}), note: baseName(e.path), line: e.line + 1 });
+        Object.assign(o, { id: e.id, title: e.title, ...(e.isTodo ? { state: e.kw } : { event: true }), ...(e.pri ? { priority: e.pri } : {}), note: e.note });
+        if (e.noteGone) o.note_missing = true;
         return o;
       });
       out.push({ date: isoDay(dn), day: WEEKDAYS[oymd(dn).w] + (dn === T ? " (today)" : ""), entries: ents });
@@ -561,71 +583,80 @@ export class Vault {
     return { today: isoDay(T), days: out };
   }
 
-  async addTask({ title, note = null, heading = null, state = "todo", priority = null, tags = [], scheduled = null, deadline = null, notes = null }) {
+  canWriteTasks() {
     this.canWrite();
-    const st = TASK_STATES.find((s) => s.id === state);
-    const text = String(title).replace(/\s*\n\s*/g, " ").trim();
-    if (!text) throw new VaultError("The task's title is empty.");
-    const p = note ? this.need(note).path : await this.daily(null);
-    const n = this.notes.get(p);
-    const tg = tags.map(cleanTag).filter(Boolean).map((t) => "#" + t);
-    const lines = [`- [ ] ${priority ? `[#${priority}] ` : ""}${[text, ...tg].join(" ")}`];
-    if (deadline) orgSetPlanning(lines, 0, "DEADLINE", orgTsStr(parseWhen(deadline)));
-    if (scheduled) orgSetPlanning(lines, 0, "SCHEDULED", orgTsStr(parseWhen(scheduled)));
-    let said = null;
-    if (st.ch !== " ") said = orgSetState(lines, 0, st.ch);
-    if (notes?.trim()) lines.push(...notes.replace(/\s+$/, "").split(/\r?\n/).map((l) => (l.trim() ? "  " + l : "")));
-    const fmRaw = n.raw.slice(0, n.raw.length - n.body.length);
-    const body = insertBlock(n.body, lines.join("\n"), heading);
-    await this.write(p, fmRaw + body);
-    await this.refresh();
-    const e = orgParse(this.notes.get(p)).filter((x) => x.isTodo && x.fullTitle === orgHead(orgLine(lines[0]).rest).title).pop();
-    return { added: e ? this.taskOut(e) : lines[0], ...(said && /^Repeats/.test(said) ? { note_on_state: said } : {}) };
+    if (this.taskMigrationRequired) throw new VaultError("Open this vault in Supstack 0.38 or later and move its legacy tasks out of the notes before adding or updating tasks.");
   }
 
-  /** The task at `line` of a note (checked against `title` when both are given), or the one task with that title. */
-  findTask(n, line, title) {
-    const tasks = orgParse(n).filter((e) => e.isTodo);
-    const t = title ? norm(title.trim()) : null;
-    const matches = (e) => norm(e.title) === t || norm(e.fullTitle) === t;
-    if (line != null) {
-      const e = tasks.find((x) => x.line === line - 1);
-      if (e && (!t || matches(e) || norm(e.fullTitle).includes(t))) return e;
-      if (!t) throw new VaultError(`Line ${line} of "${n.name}" is not a task. Its tasks: ${tasks.slice(0, 20).map((x) => `${x.line + 1}: ${x.title}`).join("; ") || "none"}.`);
+  /** Publish complete text and catch changes made since the tool read the file. */
+  async replaceTaskFile(rel, before, text) {
+    const dest = this.abs(rel);
+    const temp = path.join(path.dirname(dest), `.supstack-mcp-${randomUUID()}.tmp`);
+    await fs.mkdir(path.dirname(dest), { recursive: true });
+    try {
+      await fs.writeFile(temp, text, { encoding: "utf8", flag: "wx" });
+      if (await readText(dest) !== before) throw new VaultError(`${rel} changed on disk. Re-read the vault before retrying.`);
+      await fs.rename(temp, dest);
+    } finally {
+      await fs.rm(temp, { force: true });
     }
-    if (!t) throw new VaultError("Give the task's line, its title, or both.");
-    let hits = tasks.filter(matches);
-    if (!hits.length) hits = tasks.filter((e) => norm(e.fullTitle).includes(t));
-    if (hits.length === 1) return hits[0];
-    if (!hits.length) throw new VaultError(`No task "${title}" in "${n.name}". Its tasks: ${tasks.slice(0, 20).map((x) => `${x.line + 1}: ${x.title}`).join("; ") || "none"}.`);
-    throw new VaultError(`${hits.length} tasks match "${title}" in "${n.name}": give the line too (${hits.map((x) => `${x.line + 1}: ${x.title}`).join("; ")}).`);
   }
-  async updateTask({ note, line = null, title = null, state, priority, scheduled, deadline, new_title, tags }) {
-    this.canWrite();
-    const n = this.need(note);
-    const e = this.findTask(n, line, title);
-    const crlf = n.raw.includes("\r\n");
-    const lines = n.raw.split("\n").map((l) => l.replace(/\r$/, ""));
-    const li = e.line, said = [];
-    if (new_title != null || tags) {
-      const info = orgLine(lines[li]), o = orgHead(info.rest);
-      if (new_title != null) { const t = new_title.replace(/\s*\n\s*/g, " ").trim(); if (!t) throw new VaultError("The new title is empty."); o.title = t; said.push("Title changed"); }
-      if (tags) { o.tags = tags.map(cleanTag).filter(Boolean); said.push(o.tags.length ? "Tags set" : "Tags removed"); }
-      lines[li] = orgBuild(info, o);
+
+  async ensureNoteId(n) {
+    const existing = noteId(n);
+    if (existing) return existing;
+    if (n.fmError) throw new VaultError(`The properties of "${n.name}" are not valid YAML (${n.fmError}); fix them first.`);
+    const id = newId("n");
+    await this.replaceTaskFile(n.path, n.raw, withNoteId(n.raw, id));
+    this.byId.set(id, n);
+    return id;
+  }
+
+  async saveTask(rec) {
+    const { records, extra } = this.taskStore;
+    records.set(rec.id, rec);
+    await this.replaceTaskFile(TASKS_PATH, this.taskText, serializeTasks(records, extra));
+    return this.taskOut(taskEntry(rec, this.byId.get(rec.note)));
+  }
+
+  async addTask({ title, note = null, state = "todo", priority = null, tags = [], scheduled = null, deadline = null }) {
+    this.canWriteTasks();
+    const st = TASK_STATES.find((s) => s.id === state);
+    const text = taskTitle(title);
+    if (!text) throw new VaultError("The task's title is empty.");
+    const now = new Date().toISOString();
+    const rec = { id: newId("t"), state: " ", title: text, pri: priority, tags: taskTags(tags), created: now, upd: now };
+    if (deadline != null) rec.dead = orgTsStr(parseWhen(deadline));
+    if (scheduled != null) rec.sched = orgTsStr(parseWhen(scheduled));
+    const said = st.ch === " " ? null : taskSetState(rec, st);
+    if (note) rec.note = await this.ensureNoteId(this.need(note));
+    return { added: await this.saveTask(rec), ...(said?.startsWith("Repeats") ? { note_on_state: said } : {}) };
+  }
+
+  async updateTask({ id, note, state, priority, scheduled, deadline, new_title, tags }) {
+    this.canWriteTasks();
+    const original = this.taskStore.records.get(id);
+    if (!original || original.state === null) throw new VaultError(`No active task with ID "${id}". Use list_tasks to find it.`);
+    const rec = { ...original }, said = [];
+    if (new_title !== undefined) {
+      rec.title = taskTitle(new_title);
+      if (!rec.title) throw new VaultError("The new title is empty.");
+      said.push("Title changed");
     }
-    if (priority !== undefined) said.push(orgSetPriority(lines, li, 0, priority || null));
-    for (const [k, v] of [["DEADLINE", deadline], ["SCHEDULED", scheduled]]) {
-      if (v === undefined) continue;
-      const ts = v ? orgTsStr(parseWhen(v)) : null;
-      orgSetPlanning(lines, li, k, ts);
-      said.push(ts ? `${k}: ${ts}` : `${k} removed`);
+    if (tags !== undefined) { rec.tags = taskTags(tags); said.push(rec.tags.length ? "Tags set" : "Tags removed"); }
+    if (priority !== undefined) { rec.pri = priority; said.push(priority ? `Priority: ${priority}` : "Priority removed"); }
+    for (const [key, field, value] of [["DEADLINE", "dead", deadline], ["SCHEDULED", "sched", scheduled]]) {
+      if (value === undefined) continue;
+      rec[field] = value === null ? null : orgTsStr(parseWhen(value));
+      said.push(rec[field] ? `${key}: ${rec[field]}` : `${key} removed`);
     }
-    if (state) said.push(orgSetState(lines, li, TASK_STATES.find((s) => s.id === state).ch));
-    if (!said.length) throw new VaultError("Nothing to change: give state, priority, scheduled, deadline, new_title or tags.");
-    const raw = lines.join(crlf ? "\r\n" : "\n");
-    if (raw !== n.raw) await this.write(n.path, raw);
-    await this.refresh();
-    const now = orgParse(this.notes.get(n.path)).find((x) => x.line === li && x.isTodo);
-    return { changes: said, task: now ? this.taskOut(now) : null };
+    if (state) said.push(taskSetState(rec, TASK_STATES.find((s) => s.id === state)));
+    if (note !== undefined) {
+      rec.note = note === null ? null : await this.ensureNoteId(this.need(note));
+      said.push(note === null ? "Note link removed" : "Note linked");
+    }
+    if (!said.length) throw new VaultError("Nothing to change: give state, priority, scheduled, deadline, new_title, tags or note.");
+    rec.upd = new Date().toISOString();
+    return { changes: said, task: await this.saveTask(rec) };
   }
 }

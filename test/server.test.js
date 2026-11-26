@@ -19,6 +19,8 @@ let root, client;
 const file = (p) => fs.readFile(path.join(root, p), "utf8");
 const put = async (p, text) => { await fs.mkdir(path.dirname(path.join(root, p)), { recursive: true }); await fs.writeFile(path.join(root, p), text); };
 const exists = (p) => fs.access(path.join(root, p)).then(() => true, () => false);
+const tasksPath = ".supstack/tasks.jsonl";
+const jsonl = (records) => records.map((rec) => JSON.stringify(rec)).join("\n") + "\n";
 async function connect(dir, opts) {
   const { server } = createServer(dir, opts);
   const [a, b] = InMemoryTransport.createLinkedPair();
@@ -39,7 +41,15 @@ before(async () => {
   root = await fs.mkdtemp(path.join(os.tmpdir(), "supstack-mcp-"));
   await put("cards/Work.md", "---\nchild_order:\n  - \"[[Report]]\"\n  - \"[[Budget]]\"\nicon: briefcase\n---\nEverything about work.\n");
   await put("cards/Budget.md", "---\nparents:\n  - \"[[Work]]\"\ntags:\n  - money\n---\nNumbers for 2026. See [[Report]].\n");
-  await put("cards/Report.md", `---\nparents:\n  - "[[Work]]"\n---\n## Plan\n- [ ] [#A] Write the report :work:\n  SCHEDULED: <${day(-2)}> DEADLINE: <${day(3)}>\n  - [x] outline\n  - [/] draft\n- [<] Call the plumber #home\n  SCHEDULED: <${day(0)} 10:00 +1w>\n- Dentist <${day(1)} 14:00-15:00>\n\n## Log\n- [x] Old thing\n  CLOSED: [${day(-5)} 09:00]\n\n\`\`\`\n- [ ] not a task, it is code\n\`\`\`\n`);
+  await put("cards/Report.md", "---\nid: nreport\nparents:\n  - \"[[Work]]\"\ntags: [project]\n---\n## Plan\n- [x] outline\n- [ ] draft\n\n```\n- [ ] not a task, it is code\n```\n");
+  await put(tasksPath, jsonl([
+    { id: "treport", title: "Write the report", state: " ", note: "nreport", pri: "A", tags: ["work"], sched: `<${day(-2)}>`, dead: `<${day(3)}>`, future_field: { extra: true } },
+    { id: "tplumber", title: "Call the plumber #home", state: "<", note: "nreport", sched: `<${day()} 10:00 +1w>` },
+    { id: "tdentist", title: "Dentist", state: null, when: `<${day(1)} 14:00-15:00>` },
+    { id: "told", title: "Old thing", state: "x", note: "nreport", closed: `[${day(-5)} 09:00]` },
+    { id: "tmissing", title: "Task with missing note", state: "/", note: "nmissing" },
+  ]) + "unrecognized line\n");
+  await put(".supstack/tasks-archive.jsonl", jsonl([{ id: "tarchived", title: "Archived", state: "x", closed: `[${day(-5)} 09:00]` }]));
   await put("cards/Personal.md", "Home things. #home\n");
   await put("cards/Recipes.md", "---\nparents:\n  - \"[[Personal]]\"\n  - \"[[Work]]\"\n---\nPancakes: flour, milk, eggs.\n");
   await put(".supstack/settings.json", "{}");
@@ -66,7 +76,7 @@ test("vault_info counts notes and tasks and skips hidden folders", async () => {
   assert.equal(data.notes, 5);
   assert.equal(data.notebooks, 2);
   assert.deepEqual(data.top_level, ["Personal (1)", "Work (3)"]);
-  assert.ok(data.tags.includes("#home (2)"));
+  assert.ok(data.tags.includes("#home (1)"));
   assert.equal(data.today.slice(0, 10), iso());
   assert.deepEqual(data.tasks, { open: 3, overdue: 1, due_today: 1 });
 });
@@ -82,7 +92,8 @@ test("read_note gives the text and what is around the note", async () => {
   const { data, text } = await call("read_note", { note: "[[Report]]" });
   assert.deepEqual(data.notebooks, ["Work"]);
   assert.deepEqual(data.linked_from, ["Budget"]);
-  assert.deepEqual(data.tasks, { open: 3, closed: 2 });
+  assert.deepEqual(data.tasks, { open: 2, closed: 1 });
+  assert.deepEqual(data.checklist, { total: 2, done: 1 });
   assert.equal(text, await file("cards/Report.md"));
   const missing = await call("read_note", { note: "Repor" });
   assert.ok(missing.error);
@@ -96,18 +107,21 @@ test("search_notes ranks titles first and filters by tag and notebook", async ()
   assert.equal((await call("search_notes", { query: "flour -nothing zzz" })).data.found, 0);
 });
 
-test("list_tasks reads the six states, dates, priorities and inherited tags", async () => {
+test("list_tasks uses task IDs and reads dates, priorities and inherited tags", async () => {
   const { data } = await call("list_tasks");
-  assert.deepEqual(data.tasks.map((t) => t.title), ["Write the report", "Call the plumber #home", "draft"]);
-  const [a, b] = data.tasks;
-  assert.deepEqual({ state: a.state, priority: a.priority, subtasks: a.subtasks, under: a.under, tags: a.tags }, { state: "todo", priority: "A", subtasks: "1/2", under: "Plan", tags: ["work"] });
+  assert.deepEqual(data.tasks.map((t) => t.title), ["Write the report", "Call the plumber #home", "Task with missing note"]);
+  const [a, b, missing] = data.tasks;
+  assert.deepEqual({ id: a.id, state: a.state, priority: a.priority, tags: a.tags }, { id: "treport", state: "todo", priority: "A", tags: ["project", "work"] });
+  assert.equal(missing.note, null);
+  assert.equal(missing.note_missing, true);
   assert.equal(a.scheduled, `<${day(-2)}>`);
   assert.equal(b.state, "wait");
   assert.equal(b.scheduled, `<${day(0)} 10:00 +1w>`);
   assert.equal((await call("list_tasks", { due: "overdue" })).data.found, 1);
-  assert.equal((await call("list_tasks", { states: ["all"] })).data.found, 5);
+  assert.equal((await call("list_tasks", { states: ["all"] })).data.found, 4);
   assert.deepEqual((await call("list_tasks", { tag: "home" })).data.tasks.map((t) => t.state), ["wait"]);
   assert.equal((await call("list_tasks", { notebook: "Personal" })).data.found, 0);
+  assert.equal((await call("list_tasks", { notebook: "Work" })).data.found, 2);
 });
 
 test("agenda lists scheduled, overdue, repeating and event entries by day", async () => {
@@ -121,6 +135,8 @@ test("agenda lists scheduled, overdue, repeating and event entries by day", asyn
   assert.deepEqual(tomorrow.entries.map((e) => [e.title, e.time, e.event]), [["Dentist", "14:00-15:00", true]]);
   assert.ok(data.days[3].entries.some((e) => e.what === "Deadline"));
   assert.ok(data.days[7].entries.some((e) => e.title.startsWith("Call the plumber")), "the weekly task comes round");
+  const closed = (await call("agenda", { from: iso(-5), days: 1 })).data.days[0].entries;
+  assert.deepEqual(closed.map((e) => [e.id, e.what]), [["told", "Closed"]]);
 });
 
 test("create_note writes the frontmatter the app writes and refuses a taken name", async () => {
@@ -134,7 +150,7 @@ test("create_note writes the frontmatter the app writes and refuses a taken name
 });
 
 test("create_note applies the notebook's template", async () => {
-  await put("cards/Meeting template.md", "---\ntags:\n  - meeting\nchild_order: []\n---\n# {{title}}\nDate: {{date}}\n");
+  await put("cards/Meeting template.md", "---\nid: ntemplate\ntags:\n  - meeting\nchild_order: []\n---\n# {{title}}\nDate: {{date}}\n");
   await call("organize_note", { note: "Meeting template", notebooks: [] });
   await put("cards/Meetings.md", "---\nchild_template: \"[[Meeting template]]\"\n---\n");
   const { data } = await call("create_note", { title: "Kickoff", notebooks: ["Meetings"], body: "Agenda" });
@@ -185,45 +201,75 @@ test("reorder_notebook writes child_order", async () => {
   assert.ok((await call("reorder_notebook", { notebook: "Work", order: ["Personal"] })).error);
 });
 
-test("add_task goes to today's daily note by default, with dates read as the app reads them", async () => {
-  let r = await call("add_task", { title: "Buy milk", scheduled: "tomorrow 9:30", deadline: `${iso(4)} -1d`, priority: "B", tags: ["shop"], notes: "2 litres" });
+test("add_task captures without a note by default, with dates read as the app reads them", async () => {
+  let r = await call("add_task", { title: "Buy milk", scheduled: "tomorrow 9:30", deadline: `${iso(4)} -1d`, priority: "B", tags: ["shop"] });
   assert.equal(r.error, false);
-  const daily = `daily notes/${iso()}.md`;
-  assert.equal(await file(daily), `- [ ] [#B] Buy milk #shop\n  DEADLINE: <${day(4)} -1d> SCHEDULED: <${day(1)} 09:30>\n  2 litres\n`);
-  assert.deepEqual({ note: r.data.added.note, line: r.data.added.line, state: r.data.added.state }, { note: iso(), line: 1, state: "todo" });
-  r = await call("add_task", { title: "Review", note: "Report", heading: "Plan", state: "doing" });
-  assert.match(await file("cards/Report.md"), /14:00-15:00>\n- \[\/\] Review\n\n## Log/);
+  const { id } = r.data.added;
+  assert.deepEqual(r.data.added, {
+    id, note: null, state: "todo", title: "Buy milk", priority: "B",
+    scheduled: `<${day(1)} 09:30>`, deadline: `<${day(4)} -1d>`, tags: ["shop"],
+  });
+  assert.equal(await exists(`daily notes/${iso()}.md`), false);
+  r = await call("add_task", { title: "Review", note: "Report", state: "doing" });
+  assert.equal(r.data.added.note, "Report");
+  assert.equal(r.data.added.state, "doing");
   r = await call("add_task", { title: "Bad date", scheduled: "someday maybe" });
   assert.match(r.data, /Cannot read the date/);
+  assert.equal((await call("add_task", { title: "Old API", notes: "Do not drop this silently" })).error, true);
 });
 
-test("update_task closes with CLOSED:, reopens, and moves a repeating task on", async () => {
-  let r = await call("update_task", { note: "Report", title: "Write the report", state: "done" });
+test("update_task closes, reopens, and moves a repeating task on without changing the note", async () => {
+  const raw = await file("cards/Report.md");
+  let r = await call("update_task", { id: "treport", state: "done" });
   assert.equal(r.data.task.state, "done");
-  assert.match(await file("cards/Report.md"), new RegExp(`- \\[x\\] \\[#A\\] Write the report :work:\\n {2}CLOSED: \\[${day(0)} \\d\\d:\\d\\d\\] DEADLINE: <${day(3)}> SCHEDULED: <${day(-2)}>\\n`));
-  r = await call("update_task", { note: "Report", line: r.data.task.line, state: "todo", priority: null, scheduled: null, deadline: "+2d", new_title: "Write the big report" });
-  assert.match(await file("cards/Report.md"), new RegExp(`- \\[ \\] Write the big report :work:\\n {2}DEADLINE: <${day(2)}>\\n`));
-  r = await call("update_task", { note: "Report", title: "plumber", state: "done" });
+  assert.ok(r.data.task.closed.startsWith(`[${day()} `));
+  r = await call("update_task", { id: "treport", state: "todo", priority: null, scheduled: null, deadline: "+2d", new_title: "Write the big report" });
+  assert.equal(r.data.task.title, "Write the big report");
+  assert.equal(r.data.task.deadline, `<${day(2)}>`);
+  for (const field of ["closed", "scheduled", "priority"]) assert.equal(r.data.task[field], undefined);
+  r = await call("update_task", { id: "tplumber", state: "done" });
   assert.equal(r.data.task.state, "wait", "a repeating task stays open");
   assert.equal(r.data.task.scheduled, `<${day(7)} 10:00 +1w>`);
   assert.match(r.data.changes[0], /Repeats/);
+  assert.equal(await file("cards/Report.md"), raw);
+  const lines = (await file(tasksPath)).trimEnd().split("\n");
+  const report = JSON.parse(lines.find((line) => line.startsWith('{"id":"treport"')));
+  assert.deepEqual(report.future_field, { extra: true });
+  assert.equal(lines.at(-1), "unrecognized line");
+  assert.equal((await call("update_task", { id: "tdentist", state: "done" })).error, true);
 });
 
-test("update_task checks the title against the line and asks when several match", async () => {
-  await put("cards/Twins.md", "- [ ] Same\n- [ ] Same\n- [ ] Other\n");
-  let r = await call("update_task", { note: "Twins", title: "Same", state: "done" });
-  assert.match(r.data, /2 tasks match/);
-  r = await call("update_task", { note: "Twins", line: 1, title: "Other", state: "cancel" });
-  assert.equal(r.data.task.line, 3, "the title wins over a stale line");
-  assert.match(await file("cards/Twins.md"), /^- \[ \] Same\n- \[ \] Same\n- \[-\] Other\n {2}CLOSED: /);
-  r = await call("update_task", { note: "Twins", line: 4, state: "done" });
-  assert.match(r.data, /not a task/);
+test("parallel capture keeps both tasks and assigns a single ID without rewriting the CRLF note", async () => {
+  const raw = "---\r\n# Keep this comment\r\ntags: [windows]\r\n---\r\n- [ ] One\r\n- [ ] Two\r\n";
+  await put("cards/Crlf.md", raw);
+  const [a, b] = await Promise.all([call("add_task", { title: "Same", note: "Crlf" }), call("add_task", { title: "Same", note: "Crlf" })]);
+  const id = a.data.added.id;
+  assert.notEqual(id, b.data.added.id);
+  const note = await file("cards/Crlf.md");
+  assert.match(note, /^---\r\nid: n[a-z0-9]+\r\n/);
+  assert.equal(note.replace(/^id:.*\r\n/m, ""), raw);
+  assert.equal((await call("list_tasks", { note: "Crlf" })).data.found, 2);
+  assert.equal((await call("update_task", { id, note: null, state: "cancel" })).data.task.note, null);
+  assert.deepEqual((await call("list_tasks", { note: "Crlf" })).data.tasks.map((task) => task.id), [b.data.added.id]);
+  assert.equal((await call("update_task", { note: "Crlf", line: 1, state: "done" })).error, true);
 });
 
-test("update_task keeps Windows line endings", async () => {
-  await put("cards/Crlf.md", "- [ ] One\r\n- [ ] Two\r\n");
-  await call("update_task", { note: "Crlf", title: "One", priority: "A", scheduled: iso(1) });
-  assert.equal(await file("cards/Crlf.md"), `- [ ] [#A] One\r\n  SCHEDULED: <${day(1)}>\r\n- [ ] Two\r\n`);
+test("an older vault needs the app migration before MCP creates its task store", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "supstack-legacy-"));
+  const old = await connect(dir);
+  try {
+    const file = path.join(dir, "Legacy.md");
+    await fs.writeFile(file, `- [/] Old task\n  SCHEDULED: <${day()}>\n`);
+    assert.equal((await call("vault_info", {}, old)).data.task_migration_required, true);
+    assert.equal((await call("add_task", { title: "New task" }, old)).error, true);
+    await assert.rejects(fs.access(path.join(dir, tasksPath)), { code: "ENOENT" });
+    await fs.writeFile(file, "- [ ] Just a checklist\n");
+    assert.equal((await call("add_task", { title: "New task" }, old)).error, false);
+    assert.equal((await call("list_tasks", {}, old)).data.found, 1);
+  } finally {
+    await old.close();
+    await fs.rm(dir, { recursive: true, force: true });
+  }
 });
 
 test("rename_note updates links and the notebooks lists", async () => {
@@ -249,4 +295,16 @@ test("delete_note keeps a copy in .trash and leaves the notes inside", async () 
 test("a change made outside the server is seen on the next call", async () => {
   await put("cards/From the app.md", "Written by Supstack. #fresh\n");
   assert.deepEqual((await call("search_notes", { query: "+fresh" })).data.notes.map((n) => n.name), ["From the app"]);
+});
+
+test("linked tasks survive a rename and deletion and reconnect when their note returns", async () => {
+  await put("cards/To rename.md", "Body\n");
+  const { id } = (await call("add_task", { title: "Keep the link", note: "To rename" })).data.added;
+  const getTask = async () => (await call("list_tasks", { query: "Keep the link" })).data.tasks[0];
+  await call("rename_note", { note: "To rename", title: "Renamed" });
+  assert.equal((await getTask()).note, "Renamed");
+  const { copy } = (await call("delete_note", { note: "Renamed" })).data;
+  assert.deepEqual(await getTask(), { id, title: "Keep the link", note: null, note_missing: true, state: "todo" });
+  await put("cards/Restored.md", await file(copy));
+  assert.equal((await getTask()).note, "Restored");
 });

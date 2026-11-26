@@ -1,6 +1,6 @@
 {
   "name": "supstack-mcp",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "MCP server for Supstack: read, search and edit the notes, notebooks and tasks of a Supstack vault",
   "type": "module",
   "bin": { "supstack-mcp": "src/index.js" },
