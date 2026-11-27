@@ -23,7 +23,7 @@ const key = (name) => name.normalize("NFC").toLowerCase();
 const isMd = (p) => /\.md$/i.test(p);
 const topFolder = (p) => (p.includes("/") ? p.slice(0, p.indexOf("/")).toLowerCase() : null);
 const isoDay = (dn) => { const o = oymd(dn); return `${o.y}-${opad(o.m)}-${opad(o.d)}`; };
-const strictUtf8 = new TextDecoder("utf-8", { fatal: true });
+const strictUtf8 = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
 const nameCollator = new Intl.Collator(undefined, { numeric: true, sensitivity: "base" });
 const noteId = (n) => n.fm.id == null || n.fm.id === "" ? null : String(n.fm.id);
 const taskTitle = (title) => title.replace(/\s*[\r\n]+\s*/g, " ").trim();
@@ -122,12 +122,13 @@ export class Vault {
       [...this.notes.values()].some((n) => n.raw.length <= 400000 && hasLegacyTasks(orgParse(n)));
     return this;
   }
-  parseNote(p, raw, mtime) {
+  parseNote(p, diskText, mtime) {
+    const raw = diskText.replace(/^\uFEFF/, "");
     const { fm: fmRaw, body } = splitNote(raw);
     let fm = {}, fmError = null;
     if (fmRaw) { try { fm = parseYaml(fmInner(fmRaw)); } catch (e) { fmError = String(e.message || e).split("\n")[0]; } }
     const created = Date.parse(fm.created ?? fm.date ?? "") || null;
-    return { path: p, name: baseName(p), raw, body, fm, fmError, mtime, ctime: created || mtime, tags: noteTags(fm, body), links: noteLinks(body) };
+    return { path: p, name: baseName(p), diskText, raw, body, fm, fmError, mtime, ctime: created || mtime, tags: noteTags(fm, body), links: noteLinks(body) };
   }
   /** Names, then the hierarchy: who is in which notebook, the order inside one, and who links to whom. */
   index() {
@@ -328,12 +329,39 @@ export class Vault {
   /* ---------- writing */
 
   canWrite() { if (this.readOnly) throw new VaultError("The server was started with --read-only: the vault cannot be changed."); }
-  async write(p, raw) {
+  async checkUnchanged(rel, before) {
+    let current;
+    try { current = await fs.readFile(this.abs(rel)); }
+    catch (e) { if (e.code !== "ENOENT") throw e; }
+    if (!current?.equals(Buffer.from(before))) throw new VaultError(`${rel} changed on disk. Re-read the vault before retrying.`);
+  }
+  /** Publish complete text. A null snapshot means the destination must not exist. */
+  async write(rel, before, text) {
     this.canWrite();
-    const a = this.abs(p);
-    await fs.mkdir(path.dirname(a), { recursive: true });
-    await fs.writeFile(a, raw, "utf8");
-    this.allPaths.add(p);
+    const dest = this.abs(rel);
+    const temp = path.join(path.dirname(dest), `.supstack-mcp-${randomUUID()}.tmp`);
+    await fs.mkdir(path.dirname(dest), { recursive: true });
+    const file = await fs.open(temp, "wx");
+    try {
+      try { await file.writeFile(text, "utf8"); }
+      finally { await file.close(); }
+      if (before === null) {
+        // Publish without replacing a file created by the app or another server.
+        await fs.link(temp, dest);
+      } else {
+        await this.checkUnchanged(rel, before);
+        await fs.rename(temp, dest);
+      }
+    } catch (e) {
+      if (before === null && e.code === "EEXIST") throw new VaultError(`A file ${rel} already exists. Re-read the vault before retrying.`);
+      throw e;
+    } finally {
+      await fs.rm(temp, { force: true });
+    }
+  }
+  async writeNote(n, raw) {
+    const text = n.diskText.startsWith("\uFEFF") ? "\uFEFF" + raw : raw;
+    await this.write(n.path, n.diskText, text);
   }
   async updateFM(p, fn) {
     const n = this.notes.get(p);
@@ -341,7 +369,7 @@ export class Vault {
     const fm = structuredClone(n.fm);
     fn(fm);
     const raw = composeNote(fm, n.body);
-    if (raw !== n.raw) await this.write(p, raw);
+    if (raw !== n.raw) await this.writeNote(n, raw);
     return raw !== n.raw;
   }
   linkTo(p) { return `[[${(this.byName.get(key(baseName(p))) || []).length > 1 ? p.replace(/\.md$/i, "") : baseName(p)}]]`; }
@@ -373,7 +401,7 @@ export class Vault {
     const tg = tags.map(cleanTag).filter(Boolean);
     if (tg.length) fm.tags = [...new Set([...toStringList(fm.tags), ...tg])];
     if (icon) fm.icon = icon;
-    await this.write(p, composeNote(fm, composeBody(tplBody, body)));
+    await this.write(p, null, composeNote(fm, composeBody(tplBody, body)));
     return { created: clean, path: p, ...(parents.length ? { notebooks: parents.map(baseName) } : {}), ...(tpl ? { template: tpl.name } : {}) };
   }
 
@@ -394,7 +422,7 @@ export class Vault {
     }
     if (append != null && append.trim()) { text = insertBlock(text, append, heading); did.push(heading ? `added under "${heading}"` : "appended"); }
     if (!did.length) throw new VaultError("Nothing to change: give body, append or replace.");
-    if (fmRaw + text !== n.raw) await this.write(n.path, fmRaw + text);
+    if (fmRaw + text !== n.raw) await this.writeNote(n, fmRaw + text);
     return { note: n.name, path: n.path, changes: did };
   }
 
@@ -467,15 +495,30 @@ export class Vault {
     for (const other of this.notes.values()) {
       if (other.path === n.path) continue;
       const raw = other.raw.replace(/(!?\[\[)([^\]|#]+)([^\]]*\]\])/g, (m, a, lp, rest) => (this.resolve(lp, other.path) === n.path ? a + clean + rest : m));
-      if (raw !== other.raw) rewrites.push([other.path, raw]);
+      if (raw !== other.raw) rewrites.push([other, raw]);
     }
     // links the note has to itself
-    const own = n.raw.replace(/(!?\[\[)([^\]|#]+)([^\]]*\]\])/g, (m, a, lp, rest) => (this.resolve(lp, n.path) === n.path ? a + clean + rest : m));
-    await this.write(to, own);
-    if (key(to) !== key(n.path)) await fs.rm(this.abs(n.path));
-    else if (to !== n.path) await fs.rename(this.abs(n.path), this.abs(to)); // only the letter case changed
-    for (const [p, raw] of rewrites) await this.write(p, raw);
-    return { renamed: n.name, to: clean, path: to, links_updated_in: rewrites.map(([p]) => baseName(p)) };
+    const own = n.diskText.replace(/(!?\[\[)([^\]|#]+)([^\]]*\]\])/g, (m, a, lp, rest) => (this.resolve(lp, n.path) === n.path ? a + clean + rest : m));
+    for (const [other] of rewrites) await this.checkUnchanged(other.path, other.diskText);
+    // A case-only rename on a case-insensitive filesystem has the same source and destination.
+    const source = this.abs(n.path), dest = this.abs(to);
+    let sameFile = false;
+    if (key(to) === key(n.path)) {
+      const target = await fs.lstat(dest).catch((e) => { if (e.code !== "ENOENT") throw e; });
+      const original = await fs.lstat(source);
+      sameFile = target?.dev === original.dev && target.ino === original.ino;
+    }
+    await this.checkUnchanged(n.path, n.diskText);
+    if (sameFile) {
+      await fs.rename(source, dest);
+      if (own !== n.diskText) await this.write(to, n.diskText, own);
+    } else {
+      await this.write(to, null, own);
+      await this.checkUnchanged(n.path, n.diskText);
+      await fs.rm(source);
+    }
+    for (const [other, raw] of rewrites) await this.writeNote(other, raw);
+    return { renamed: n.name, to: clean, path: to, links_updated_in: rewrites.map(([other]) => other.name) };
   }
 
   /** Delete a note the way the app does: a copy goes to .trash, the notes inside it stay. */
@@ -486,8 +529,9 @@ export class Vault {
     let tp = ".trash/" + file, i = 1;
     const exists = async (p) => fs.access(this.abs(p)).then(() => true, () => false);
     while (await exists(tp)) tp = `.trash/${n.name} ${i++}.md`;
-    await this.write(tp, n.raw);
-    this.allPaths.delete(tp);
+    await this.checkUnchanged(n.path, n.diskText);
+    await this.write(tp, null, n.diskText);
+    await this.checkUnchanged(n.path, n.diskText);
     await fs.rm(this.abs(n.path));
     const kids = this.childrenOf(n.path).map(baseName);
     const back = [...(this.linksIn.get(n.path) ?? [])].map(baseName);
@@ -504,7 +548,7 @@ export class Vault {
     const have = [...this.notes.keys()].find((x) => key(x) === key(p));
     if (have) return have;
     if (!create) return null;
-    await this.write(p, "");
+    await this.write(p, null, "");
     await this.refresh();
     return p;
   }
@@ -588,26 +632,12 @@ export class Vault {
     if (this.taskMigrationRequired) throw new VaultError("Open this vault in Supstack 0.38 or later and move its legacy tasks out of the notes before adding or updating tasks.");
   }
 
-  /** Publish complete text and catch changes made since the tool read the file. */
-  async replaceTaskFile(rel, before, text) {
-    const dest = this.abs(rel);
-    const temp = path.join(path.dirname(dest), `.supstack-mcp-${randomUUID()}.tmp`);
-    await fs.mkdir(path.dirname(dest), { recursive: true });
-    try {
-      await fs.writeFile(temp, text, { encoding: "utf8", flag: "wx" });
-      if (await readText(dest) !== before) throw new VaultError(`${rel} changed on disk. Re-read the vault before retrying.`);
-      await fs.rename(temp, dest);
-    } finally {
-      await fs.rm(temp, { force: true });
-    }
-  }
-
   async ensureNoteId(n) {
     const existing = noteId(n);
     if (existing) return existing;
     if (n.fmError) throw new VaultError(`The properties of "${n.name}" are not valid YAML (${n.fmError}); fix them first.`);
     const id = newId("n");
-    await this.replaceTaskFile(n.path, n.raw, withNoteId(n.raw, id));
+    await this.writeNote(n, withNoteId(n.raw, id));
     this.byId.set(id, n);
     return id;
   }
@@ -615,7 +645,7 @@ export class Vault {
   async saveTask(rec) {
     const { records, extra } = this.taskStore;
     records.set(rec.id, rec);
-    await this.replaceTaskFile(TASKS_PATH, this.taskText, serializeTasks(records, extra));
+    await this.write(TASKS_PATH, this.taskText, serializeTasks(records, extra));
     return this.taskOut(taskEntry(rec, this.byId.get(rec.note)));
   }
 

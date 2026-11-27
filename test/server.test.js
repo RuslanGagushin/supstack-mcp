@@ -7,7 +7,7 @@ import path from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { createServer } from "../src/server.js";
-import { insertBlock } from "../src/vault.js";
+import { insertBlock, Vault } from "../src/vault.js";
 
 const pad = (n) => String(n).padStart(2, "0");
 const DAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
@@ -295,6 +295,55 @@ test("delete_note keeps a copy in .trash and leaves the notes inside", async () 
 test("a change made outside the server is seen on the next call", async () => {
   await put("cards/From the app.md", "Written by Supstack. #fresh\n");
   assert.deepEqual((await call("search_notes", { query: "+fresh" })).data.notes.map((n) => n.name), ["From the app"]);
+});
+
+test("a note changed on disk after refresh is not overwritten or recreated", async () => {
+  const rel = "cards/Concurrent edit.md";
+  await put(rel, "Original\n");
+  const vault = await new Vault(root).refresh();
+  await put(rel, "App edit\n");
+  await assert.rejects(vault.edit({ note: "Concurrent edit", append: "MCP edit" }), /changed on disk/);
+  await assert.rejects(vault.organize({ note: "Concurrent edit", add_tags: ["mcp"] }), /changed on disk/);
+  assert.equal(await file(rel), "App edit\n");
+  await fs.unlink(path.join(root, rel));
+  await assert.rejects(vault.edit({ note: "Concurrent edit", append: "MCP edit" }), /changed on disk/);
+  assert.equal(await exists(rel), false);
+  assert.ok(!(await fs.readdir(path.join(root, "cards"))).some((name) => name.endsWith(".tmp")));
+});
+
+test("a note or daily note created after refresh is not overwritten", async () => {
+  const vault = await new Vault(root).refresh();
+  await put("cards/Concurrent create.md", "App note\n");
+  await put("daily notes/2031-02-03.md", "App daily note\n");
+  await assert.rejects(vault.create({ title: "Concurrent create", body: "MCP note" }), /already exists/);
+  await assert.rejects(vault.daily("2031-02-03"), /already exists/);
+  assert.equal(await file("cards/Concurrent create.md"), "App note\n");
+  assert.equal(await file("daily notes/2031-02-03.md"), "App daily note\n");
+});
+
+test("rename and delete refuse stale note snapshots", async () => {
+  const source = "cards/Concurrent rename.md", backlink = "cards/Concurrent backlink.md";
+  await put(source, "Original\n");
+  await put(backlink, "See [[Concurrent rename]].\n");
+  const vault = await new Vault(root).refresh();
+  await put(backlink, "App edit: [[Concurrent rename]].\n");
+  await assert.rejects(vault.rename({ note: "Concurrent rename", title: "New name" }), /Concurrent backlink\.md changed on disk/);
+  assert.equal(await file(source), "Original\n");
+  assert.equal(await exists("cards/New name.md"), false);
+  await put(source, "App edit\n");
+  await assert.rejects(vault.remove({ note: "Concurrent rename" }), /Concurrent rename\.md changed on disk/);
+  assert.equal(await file(source), "App edit\n");
+  assert.equal(await exists(".trash/Concurrent rename.md"), false);
+});
+
+test("case-only rename preserves a note's BOM and updates its self-link", async () => {
+  await put("cards/Mixed Case.md", "\uFEFFSee [[Mixed Case]].\n");
+  const { data, error } = await call("rename_note", { note: "Mixed Case", title: "Mixed case" });
+  assert.equal(error, false, String(data));
+  assert.equal(await file(data.path), "\uFEFFSee [[Mixed case]].\n");
+  const names = await fs.readdir(path.join(root, "cards"));
+  assert.ok(names.includes("Mixed case.md"));
+  assert.ok(!names.includes("Mixed Case.md"));
 });
 
 test("linked tasks survive a rename and deletion and reconnect when their note returns", async () => {

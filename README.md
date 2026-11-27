@@ -69,7 +69,9 @@ For a pre-0.38 vault, run **Move tasks from notes to the agenda…** in the app.
 ## Good to know
 
 - **Sync.** The server never runs git. Changes it makes go out with the app's next sync.
-- **A note open in the app.** If you are editing a note in Supstack while the server changes the same note, the app's next save can overwrite the change. Leave the editor (Done) first.
+- **Concurrent changes.** The server stages complete files before publishing them. It refuses to overwrite a file at a new path and checks existing contents again before replacing them. If the tool reports a conflict, re-read the affected files before retrying. The check and replacement are separate filesystem operations; rename with link updates, delete to trash and task linking can change more than one file and have no rollback.
+- **Filesystem.** Publishing to a new path without overwriting requires hard-link support in the vault filesystem (for example, NTFS, APFS or ext4).
+- **A note open in the app.** Finish editing the same note (Done) before asking the server to change it. If the editor has noticed a disk change when it saves unsaved typing, it keeps the disk version in a conflict copy. An edit it has not noticed can still be overwritten.
 - **Android.** The server needs the vault as a folder on the computer it runs on, so it works with the desktop vault, or a clone of the vault's git repository.
 - **Pins and saved views** that point at a renamed note are not updated: they are kept in the app's settings, which the server does not touch.
 - Note tools skip hidden folders. The task tools read the active task file and leave `.supstack/tasks-archive.jsonl` alone.
